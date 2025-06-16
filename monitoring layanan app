@@ -1,0 +1,586 @@
+import React, { useEffect, useState, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import {
+  getFirestore, collection, onSnapshot,
+  addDoc, updateDoc, deleteDoc, doc,
+  serverTimestamp, query, orderBy
+} from 'firebase/firestore';
+import { Plus, Edit, Trash2, Inbox, CheckCircle, Clock, Repeat, ClipboardCheck, X, Check } from 'lucide-react';
+
+// Variabel global yang disediakan oleh lingkungan Canvas
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Menginisialisasi Firebase di luar komponen React untuk menghindari inisialisasi berulang
+let app;
+let auth;
+let db;
+
+function App() {
+  const [services, setServices] = useState([]); // Daftar semua layanan
+  const [statusCounts, setStatusCounts] = useState({
+    masuk: 0,
+    diverifikasi: 0,
+    pending: 0,
+    followup: 0,
+    selesai: 0,
+  }); // Jumlah layanan per status
+  const [showAddModal, setShowAddModal] = useState(false); // Kontrol modal tambah layanan
+  const [showEditModal, setShowEditModal] = useState(false); // Kontrol modal edit layanan
+  const [showConfirmModal, setShowConfirmModal] = useState(false); // Kontrol modal konfirmasi hapus
+  const [currentService, setCurrentService] = useState(null); // Layanan yang sedang diedit/dihapus
+  const [isAuthReady, setIsAuthReady] = useState(false); // Status kesiapan otentikasi Firebase
+  const [userId, setUserId] = useState(''); // ID pengguna saat ini
+  const [loading, setLoading] = useState(true); // Status loading data
+
+  // Inisialisasi Firebase dan otentikasi
+  useEffect(() => {
+    try {
+      app = initializeApp(firebaseConfig);
+      auth = getAuth(app);
+      db = getFirestore(app);
+
+      // Listener perubahan status otentikasi
+      const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+        if (!user) {
+          // Jika tidak ada user, coba sign in dengan token atau anonim
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(auth, initialAuthToken);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (error) {
+            console.error("Error signing in:", error);
+          }
+        }
+        setUserId(auth.currentUser?.uid || crypto.randomUUID()); // Set userId, pakai uid jika ada, random jika anonim
+        setIsAuthReady(true); // Otentikasi siap
+      });
+
+      return () => unsubscribeAuth(); // Cleanup listener saat komponen dilepas
+    } catch (error) {
+      console.error("Error initializing Firebase:", error);
+      setIsAuthReady(true); // Tetapkan siap meskipun ada kesalahan agar UI tidak macet
+      setLoading(false);
+    }
+  }, []);
+
+  // Listener Firestore untuk data layanan
+  useEffect(() => {
+    if (!db || !isAuthReady) return; // Tunggu db dan otentikasi siap
+
+    setLoading(true);
+    // Path collection untuk data publik/kolaboratif
+    const servicesColRef = collection(db, `artifacts/${appId}/public/data/services`);
+    // Query untuk mengambil data dan mengurutkan berdasarkan 'timestamp'
+    const q = query(servicesColRef, orderBy('timestamp', 'desc'));
+
+    const unsubscribeSnapshot = onSnapshot(q, (snapshot) => {
+      const servicesData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setServices(servicesData);
+      setLoading(false);
+    }, (error) => {
+      console.error("Error fetching services:", error);
+      setLoading(false);
+    });
+
+    return () => unsubscribeSnapshot(); // Cleanup listener saat komponen dilepas
+  }, [db, isAuthReady, userId]); // Dependensi: db, status otentikasi, userId
+
+  // Fungsi untuk menghitung jumlah layanan per status
+  useEffect(() => {
+    const counts = {
+      masuk: 0,
+      diverifikasi: 0,
+      pending: 0,
+      followup: 0,
+      selesai: 0,
+    };
+    services.forEach(service => {
+      if (counts.hasOwnProperty(service.status)) {
+        counts[service.status]++;
+      }
+    });
+    setStatusCounts(counts);
+  }, [services]); // Hitung ulang saat daftar layanan berubah
+
+  // Fungsi untuk menambahkan layanan baru
+  const addService = async (service) => {
+    if (!db) {
+      console.error("Firestore is not initialized.");
+      return;
+    }
+    try {
+      // Tambahkan timestamp untuk pengurutan dan pelacakan
+      await addDoc(collection(db, `artifacts/${appId}/public/data/services`), {
+        ...service,
+        timestamp: serverTimestamp(), // Menggunakan serverTimestamp untuk konsistensi waktu
+        createdBy: userId, // Catat siapa yang membuat layanan
+      });
+      setShowAddModal(false);
+    } catch (e) {
+      console.error("Error adding document: ", e);
+    }
+  };
+
+  // Fungsi untuk memperbarui layanan yang sudah ada
+  const updateService = async (id, updatedFields) => {
+    if (!db) {
+      console.error("Firestore is not initialized.");
+      return;
+    }
+    try {
+      const serviceRef = doc(db, `artifacts/${appId}/public/data/services`, id);
+      await updateDoc(serviceRef, updatedFields);
+      setShowEditModal(false);
+      setCurrentService(null);
+    } catch (e) {
+      console.error("Error updating document: ", e);
+    }
+  };
+
+  // Fungsi untuk menghapus layanan
+  const deleteService = async (id) => {
+    if (!db) {
+      console.error("Firestore is not initialized.");
+      return;
+    }
+    try {
+      const serviceRef = doc(db, `artifacts/${appId}/public/data/services`, id);
+      await deleteDoc(serviceRef);
+      setShowConfirmModal(false);
+      setCurrentService(null);
+    } catch (e) {
+      console.error("Error deleting document: ", e);
+    }
+  };
+
+  // Komponen Kartu Status
+  const StatusCard = ({ title, count, icon, bgColor }) => (
+    <div className={`flex items-center justify-between p-4 rounded-lg shadow-lg ${bgColor}`}>
+      <div className="flex flex-col">
+        <span className="text-white text-sm font-medium">{title}</span>
+        <span className="text-white text-3xl font-bold">{count}</span>
+      </div>
+      {icon}
+    </div>
+  );
+
+  // Komponen Modal Dasar
+  const Modal = ({ show, onClose, title, children }) => {
+    if (!show) return null;
+    return (
+      <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div className="bg-white rounded-lg shadow-xl w-full max-w-lg p-6 relative">
+          <h2 className="text-2xl font-bold mb-4 text-gray-800">{title}</h2>
+          <button
+            onClick={onClose}
+            className="absolute top-4 right-4 text-gray-500 hover:text-gray-700 focus:outline-none"
+          >
+            <X size={24} />
+          </button>
+          {children}
+        </div>
+      </div>
+    );
+  };
+
+  // Komponen Form Layanan (digunakan untuk tambah dan edit)
+  const ServiceForm = ({ initialData = {}, onSubmit, onClose, isEdit = false }) => {
+    // Definisi pilihan untuk judul layanan
+    const serviceTitleOptions = [
+      'VOA', 'ITK', 'ITAS', 'ITAP', 'IMK', 'Affidavit', 'ABG', 'Lain-lain'
+    ];
+
+    const [formData, setFormData] = useState({
+      title: initialData.title || '',
+      description: initialData.description || '',
+      status: initialData.status || 'masuk',
+      dateEntered: initialData.dateEntered ? initialData.dateEntered.split('T')[0] : new Date().toISOString().split('T')[0],
+      // Menambahkan state untuk nomor paspor
+      passportNumber: initialData.passportNumber || '',
+    });
+
+    const handleChange = (e) => {
+      const { name, value } = e.target;
+      setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      const validStatuses = ['masuk', 'diverifikasi', 'pending', 'followup', 'selesai'];
+      if (!validStatuses.includes(formData.status)) {
+        console.error("Status layanan tidak valid.");
+        return;
+      }
+      onSubmit(formData);
+    };
+
+    // Mengecek apakah input nomor paspor harus ditampilkan
+    const showPassportInput = formData.title !== 'ABG' && formData.title !== 'Lain-lain';
+
+    return (
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label htmlFor="title" className="block text-sm font-medium text-gray-700">Judul Layanan</label>
+          <select
+            id="title"
+            name="title"
+            value={formData.title}
+            onChange={handleChange}
+            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500"
+            required
+          >
+            <option value="" disabled>Pilih Judul Layanan</option> {/* Pilihan default kosong */}
+            {serviceTitleOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Kolom Nomor Paspor (kondisional) */}
+        {showPassportInput && (
+          <div>
+            <label htmlFor="passportNumber" className="block text-sm font-medium text-gray-700">Nomor Paspor</label>
+            <input
+              type="text"
+              id="passportNumber"
+              name="passportNumber"
+              value={formData.passportNumber}
+              onChange={handleChange}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500"
+              placeholder="Masukkan nomor paspor"
+              // required={showPassportInput} // Membuat wajib jika ditampilkan
+            />
+          </div>
+        )}
+
+        <div>
+          <label htmlFor="description" className="block text-sm font-medium text-gray-700">Deskripsi</label>
+          <textarea
+            id="description"
+            name="description"
+            value={formData.description}
+            onChange={handleChange}
+            rows="3"
+            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500"
+            required
+          ></textarea>
+        </div>
+        <div>
+          <label htmlFor="dateEntered" className="block text-sm font-medium text-gray-700">Tanggal Masuk</label>
+          <input
+            type="date"
+            id="dateEntered"
+            name="dateEntered"
+            value={formData.dateEntered}
+            onChange={handleChange}
+            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500"
+            required
+          />
+        </div>
+        <div>
+          <label htmlFor="status" className="block text-sm font-medium text-gray-700">Status</label>
+          <select
+            id="status"
+            name="status"
+            value={formData.status}
+            onChange={handleChange}
+            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500"
+            required
+          >
+            <option value="masuk">Masuk</option>
+            <option value="diverifikasi">Diverifikasi</option>
+            <option value="pending">Pending</option>
+            <option value="followup">Follow Up</option>
+            <option value="selesai">Selesai Diproses</option>
+          </select>
+        </div>
+
+        <div className="flex justify-end space-x-3 mt-6">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 bg-gray-200 text-gray-800 rounded-md hover:bg-gray-300 transition-colors duration-200"
+          >
+            Batal
+          </button>
+          <button
+            type="submit"
+            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors duration-200 flex items-center justify-center gap-2"
+          >
+            {isEdit ? <Check size={18} /> : <Plus size={18} />}
+            {isEdit ? 'Perbarui Layanan' : 'Tambah Layanan'}
+          </button>
+        </div>
+      </form>
+    );
+  };
+
+  // Fungsi untuk menampilkan modal edit
+  const openEditModal = (service) => {
+    setCurrentService(service);
+    setShowEditModal(true);
+  };
+
+  // Fungsi untuk menampilkan modal konfirmasi hapus
+  const openConfirmModal = (service) => {
+    setCurrentService(service);
+    setShowConfirmModal(true);
+  };
+
+  // Warna status untuk tampilan tabel
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'masuk': return 'bg-blue-100 text-blue-800';
+      case 'diverifikasi': return 'bg-green-100 text-green-800';
+      case 'pending': return 'bg-yellow-100 text-yellow-800';
+      case 'followup': return 'bg-purple-100 text-purple-800';
+      case 'selesai': return 'bg-gray-100 text-gray-800';
+      default: return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  // Fungsi untuk mengecek apakah layanan sudah lebih dari 2 hari belum diperbarui (kecuali status 'selesai')
+  const isOverdue = (service) => {
+    if (service.status === 'selesai' || !service.timestamp) {
+      return false; // Layanan selesai tidak pernah 'overdue', dan jika timestamp tidak ada, tidak bisa dicek
+    }
+
+    const serviceDate = service.timestamp.toDate(); // Mengubah Firebase Timestamp menjadi objek Date
+    const currentDate = new Date();
+    const diffTime = Math.abs(currentDate.getTime() - serviceDate.getTime());
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); // Selisih dalam hari
+
+    return diffDays > 2;
+  };
+
+  return (
+    // Mengubah main div menjadi relative untuk menempatkan background absolut
+    <div className="min-h-screen bg-gray-100 font-inter antialiased p-4 sm:p-6 lg:p-8 relative overflow-hidden">
+      {/* Background image dengan opacity 50% */}
+      <div
+        className="absolute inset-0 z-0 bg-cover bg-center bg-no-repeat opacity-20" /* Menggunakan opacity-20 agar tidak terlalu mencolok */
+        style={{ backgroundImage: `url('LOGO KEMENTRIAN IMIGRASI.jpg')` }}
+      ></div>
+
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+      `}</style>
+
+      {/* Header Aplikasi - Pastikan z-index lebih tinggi dari background */}
+      <header className="bg-white shadow-lg rounded-lg p-6 mb-8 flex flex-col sm:flex-row justify-between items-center relative z-10">
+        <div className="flex items-center gap-4 mb-4 sm:mb-0">
+          {/* Logo Imigrasi Indonesia */}
+          <img
+            src="logo imigrasi.png" // Menggunakan nama file yang diunggah
+            alt="Logo Imigrasi Indonesia"
+            className="w-16 h-16 rounded-full shadow-md"
+            onError={(e) => { e.target.onerror = null; e.target.src="https://placehold.co/64x64/cccccc/333333?text=Error"; }}
+          />
+          <h1 className="text-3xl font-bold text-gray-800">
+            Aplikasi Monitoring Layanan INTALTUSKIM 2025
+          </h1>
+        </div>
+        <div className="bg-gray-200 px-4 py-2 rounded-full text-sm text-gray-700 font-medium">
+          User ID: <span className="font-semibold">{userId}</span>
+        </div>
+      </header>
+
+      {/* Kartu Status Ringkasan - Pastikan z-index lebih tinggi dari background */}
+      <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6 mb-8 relative z-10">
+        <StatusCard
+          title="Masuk"
+          count={statusCounts.masuk}
+          icon={<Inbox size={48} className="text-white opacity-75" />}
+          bgColor="bg-blue-600"
+        />
+        <StatusCard
+          title="Diverifikasi"
+          count={statusCounts.diverifikasi}
+          icon={<CheckCircle size={48} className="text-white opacity-75" />}
+          bgColor="bg-green-600"
+        />
+        <StatusCard
+          title="Pending"
+          count={statusCounts.pending}
+          icon={<Clock size={48} className="text-white opacity-75" />}
+          bgColor="bg-yellow-600"
+        />
+        <StatusCard
+          title="Follow Up"
+          count={statusCounts.followup}
+          icon={<Repeat size={48} className="text-white opacity-75" />}
+          bgColor="bg-purple-600"
+        />
+        <StatusCard
+          title="Selesai Diproses"
+          count={statusCounts.selesai}
+          icon={<ClipboardCheck size={48} className="text-white opacity-75" />}
+          bgColor="bg-gray-600"
+        />
+      </section>
+
+      {/* Bagian Daftar Layanan - Pastikan z-index lebih tinggi dari background */}
+      <section className="bg-white shadow-lg rounded-lg p-6 relative z-10">
+        <div className="flex justify-between items-center mb-6">
+          <h2 className="text-2xl font-bold text-gray-800">Daftar Layanan</h2>
+          <button
+            onClick={() => setShowAddModal(true)}
+            className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-md shadow-md hover:bg-blue-700 transition-colors duration-200 text-lg font-semibold"
+          >
+            <Plus size={24} className="mr-2" /> Tambah Layanan
+          </button>
+        </div>
+
+        {loading && (
+          <div className="text-center py-8 text-gray-600 text-lg">Memuat data...</div>
+        )}
+
+        {!loading && services.length === 0 && (
+          <div className="text-center py-8 text-gray-600 text-lg">Belum ada layanan yang dicatat.</div>
+        )}
+
+        {!loading && services.length > 0 && (
+          <div className="overflow-x-auto rounded-lg border border-gray-200">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Judul Layanan
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Nomor Paspor
+                  </th> {/* Kolom baru */}
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Deskripsi
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Tanggal Masuk
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Dibuat Oleh
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Aksi
+                  </th>
+                </tr>
+              </thead>
+              {/* FIX: Menghapus baris kosong di sini untuk mencegah kesalahan validasi DOM */}
+              <tbody className="bg-white divide-y divide-gray-200">
+                {services.map((service) => (
+                  // Menambahkan kelas kondisional untuk menandai baris yang 'overdue'
+                  <tr key={service.id} className={isOverdue(service) ? 'bg-red-50' : ''}>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                      {service.title}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {service.passportNumber || '-'} {/* Menampilkan nomor paspor */}
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-500 max-w-xs truncate">
+                      {service.description}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {service.dateEntered}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm">
+                      <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${getStatusColor(service.status)}`}>
+                        {service.status === 'followup' ? 'Follow Up' : service.status.charAt(0).toUpperCase() + service.status.slice(1)}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 truncate max-w-[120px]">
+                        {service.createdBy || 'N/A'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                      <button
+                        onClick={() => openEditModal(service)}
+                        className="text-blue-600 hover:text-blue-900 mr-3 p-2 rounded-md hover:bg-blue-100 transition-colors duration-200"
+                        title="Edit Layanan"
+                      >
+                        <Edit size={20} />
+                      </button>
+                      <button
+                        onClick={() => openConfirmModal(service)}
+                        className="text-red-600 hover:text-red-900 p-2 rounded-md hover:bg-red-100 transition-colors duration-200"
+                        title="Hapus Layanan"
+                      >
+                        <Trash2 size={20} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* Modal Tambah Layanan */}
+      <Modal
+        show={showAddModal}
+        onClose={() => setShowAddModal(false)}
+        title="Tambah Layanan Baru"
+      >
+        <ServiceForm
+          onSubmit={addService}
+          onClose={() => setShowAddModal(false)}
+        />
+      </Modal>
+
+      {/* Modal Edit Layanan */}
+      <Modal
+        show={showEditModal}
+        onClose={() => setShowEditModal(false)}
+        title="Edit Layanan"
+      >
+        {currentService && (
+          <ServiceForm
+            initialData={currentService}
+            onSubmit={(updatedFields) => updateService(currentService.id, updatedFields)}
+            onClose={() => setShowEditModal(false)}
+            isEdit={true}
+          />
+        )}
+      </Modal>
+
+      {/* Modal Konfirmasi Hapus */}
+      <Modal
+        show={showConfirmModal}
+        onClose={() => setShowConfirmModal(false)}
+        title="Konfirmasi Hapus"
+      >
+        <p className="text-gray-700 mb-6">
+          Apakah Anda yakin ingin menghapus layanan "<strong>{currentService?.title}</strong>"? Tindakan ini tidak bisa dibatalkan.
+        </p>
+        <div className="flex justify-end space-x-3">
+          <button
+            onClick={() => setShowConfirmModal(false)}
+            className="px-4 py-2 bg-gray-200 text-gray-800 rounded-md hover:bg-gray-300 transition-colors duration-200"
+          >
+            Batal
+          </button>
+          <button
+            onClick={() => deleteService(currentService.id)}
+            className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors duration-200 flex items-center justify-center gap-2"
+          >
+            <Trash2 size={18} /> Hapus
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+export default App;
